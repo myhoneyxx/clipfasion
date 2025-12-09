@@ -1,0 +1,26 @@
+# IDE 配置（消除换行符警告的核心）
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 生成的缓存/数据文件
+*.pkl
+user_behavior.json
+
+# 图片/大文件（可选，若不需要追踪）
+Images/
+test_Images/
+
+# 第三方模型/依赖
+clip-vit-base-patch32/
+
+# 其他冗余文件
+.DS_Store
+*.log
