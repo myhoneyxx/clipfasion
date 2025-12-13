@@ -31,7 +31,10 @@ class FashionUI:
             # 🚨 NEW FUNCTION: 获取活动记录
             get_activity_history_fn: Callable[[Optional[int]], List[str]],
             # 🚨 NEW FUNCTION: 删除活动记录
-            delete_history_fn: Callable[[Optional[int]], bool]
+            delete_history_fn: Callable[[Optional[int]], bool],
+
+            # 🚨🚨🚨 NEW: 传入搜索点击跟踪函数
+            track_search_click_fn: Callable[[Optional[int], int], str]
     ) -> gr.Blocks:
         """创建界面（Amazon 极简风格重构，包含用户中心）"""
         css = self._get_css()
@@ -73,7 +76,9 @@ class FashionUI:
                 search_section_results = self._add_search_section(
                     text_search_fn=text_search_fn,
                     image_search_fn=image_search_fn,
-                    logged_in_user=logged_in_user
+                    logged_in_user=logged_in_user,
+                    # 🚨 传入新参数
+                    track_search_click_fn=track_search_click_fn
                 )
                 search_results_gallery = search_section_results[0]
 
@@ -391,7 +396,9 @@ class FashionUI:
             # 改造: Service 层返回 List[Tuple[Image.Image, str]] (Image, Caption)
             text_search_fn: Callable[[str, int, Optional[int]], List[Tuple[Image.Image, str]]],
             image_search_fn: Callable[[Image.Image, int, Optional[int]], List[Tuple[Image.Image, str]]],
-            logged_in_user: gr.State
+            logged_in_user: gr.State,
+            # 🚨🚨🚨 NEW: 接收搜索点击函数
+            track_search_click_fn: Callable[[Optional[int], int], str]
     ) -> Tuple[gr.Gallery]:
         """🚨 核心：Amazon 搜索优先，搜索框放大居中"""
 
@@ -491,6 +498,21 @@ class FashionUI:
                                   outputs=search_results)
             image_search_btn.click(fn=handle_image_search, inputs=[logged_in_user, image_query, image_top_k],
                                    outputs=search_results)
+
+            # 🚨🚨🚨 NEW: 绑定搜索结果点击事件
+            def on_search_result_select(user_info, evt: gr.SelectData):
+                user_id = user_info[0] if user_info else None
+                if user_id:
+                    # 调用后台记录，不需要返回任何UI更新
+                    msg = track_search_click_fn(user_id, evt.index)
+                    # 可选：打印日志
+                    # print(f"UI Log: {msg}")
+
+            search_results.select(
+                fn=on_search_result_select,
+                inputs=[logged_in_user],
+                outputs=None  # 不更新界面，只发请求
+            )
 
             return (search_results,)  # 返回搜索结果 Gallery
 

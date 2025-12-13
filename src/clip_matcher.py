@@ -1,14 +1,14 @@
 import os
-import torch
+import pickle
+from typing import List, Tuple
+
+import faiss
 import numpy as np
 import pandas as pd
+import torch
 from PIL import Image
-import faiss
-from transformers import CLIPProcessor, CLIPModel
-from typing import List, Tuple, Union
-import pickle
 from tqdm import tqdm
-import cv2
+from transformers import CLIPProcessor, CLIPModel
 
 
 class CLIPMatcher:
@@ -22,6 +22,7 @@ class CLIPMatcher:
             model_path: CLIP模型路径
             device: 计算设备 ('cuda', 'cpu' 或 None 自动选择)
         """
+        self.partition_indexes = {}
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"使用设备: {self.device}")
 
@@ -187,6 +188,101 @@ class CLIPMatcher:
 
             print(f"文本索引已保存到 {save_path}")
 
+    def build_partition_index(self, captions_file: str):
+        """
+        辅助函数：基于 CSV 类别信息构建分片索引 (作为 CLIPMatcher 类的方法)
+
+        Args:
+            captions_file: 包含 image 和 caption 列的 CSV 文件路径
+        """
+        print(f"\n[3/3] 🍰 正在构建分片索引 (解决类别不平衡)...")
+
+        # 1. 读取CSV获取类别信息
+        try:
+            # 确保 pandas 已在文件顶部导入: import pandas as pd
+            df = pd.read_csv(captions_file)
+        except Exception as e:
+            print(f"      ❌ 读取描述文件失败: {e}")
+            return
+
+        # 2. 创建文件名到类别的映射字典
+        print("      正在解析类别映射...")
+        img_category_map = {}
+        for _, row in df.iterrows():
+            # 确保转为字符串并小写，防止 AttributeError
+            fname = str(row['image'])
+            caption = str(row['caption']).lower()
+
+            # 简单分类规则
+            if "footwear" in caption or "shoes" in caption:
+                cat = "footwear"
+            elif "apparel" in caption:
+                cat = "apparel"
+            else:
+                cat = "others"
+            img_category_map[fname] = cat
+
+        # 3. 准备分桶容器
+        partitions = {
+            "apparel": {'paths': [], 'features': []},
+            "footwear": {'paths': [], 'features': []},
+            "others": {'paths': [], 'features': []}
+        }
+
+        # 4. 遍历 self 中已经算好的所有图片和特征
+        # 修正点：使用 self.image_paths 代替 matcher.image_paths
+        if not hasattr(self, 'image_paths') or not self.image_paths:
+            print("      ⚠️ 警告: 内存中没有图像特征，请先调用 build_image_index。")
+            return
+
+        total_images = len(self.image_paths)  # 👈 已修正为 self
+
+        print(f"      正在对 {total_images} 张图像进行分类拆分...")
+
+        count_hit = 0
+        for idx, path in enumerate(self.image_paths):  # 👈 已修正为 self
+            filename = os.path.basename(path)
+            # 查找该图片的类别，找不到默认为 others
+            category = img_category_map.get(filename, "others")
+
+            if category in partitions:
+                partitions[category]['paths'].append(path)
+                # 修正点：使用 self.image_features 代替 matcher.image_features
+                partitions[category]['features'].append(self.image_features[idx])  # 👈 已修正为 self
+                count_hit += 1
+
+        # 5. 保存分片索引
+        for cat_name, data in partitions.items():
+            paths = data['paths']
+            feats = data['features']
+
+            if len(paths) > 0:
+                # 转换为 FAISS 需要的 float32 numpy 数组
+                # 确保 numpy 已导入: import numpy as np
+                feats_np = np.array(feats).astype('float32')
+
+                # 构建 FAISS 索引
+                # 确保 faiss 已导入
+                dimension = feats_np.shape[1]
+                sub_index = faiss.IndexFlatIP(dimension)
+                sub_index.add(feats_np)
+
+                # 保存为 pkl 文件
+                save_path = f"index_{cat_name}.pkl"
+                index_data = {
+                    'image_paths': paths,
+                    'image_features': feats_np,
+                    'image_index': faiss.serialize_index(sub_index)
+                }
+
+                try:
+                    with open(save_path, 'wb') as f:
+                        # 确保 pickle 已导入
+                        pickle.dump(index_data, f)
+                    print(f"      ✅ 已保存分片: {save_path} (包含 {len(paths)} 条)")
+                except Exception as e:
+                    print(f"      ❌ 保存分片 {save_path} 失败: {e}")
+
     def load_image_index(self, index_path: str = "image_index.pkl"):
         """加载图像索引"""
         try:
@@ -220,6 +316,50 @@ class CLIPMatcher:
             print(f"加载文本索引失败: {e}")
             return False
 
+    def load_partition_indexes(self, index_dir="."):
+        """
+        加载所有 index_xxx.pkl 分片文件到内存
+
+        Args:
+            index_dir: 索引文件所在的目录
+
+        Returns:
+            bool: 是否成功加载了至少一个分片
+        """
+        if not os.path.exists(index_dir):
+            print(f"❌ 索引目录不存在: {index_dir}")
+            return False
+
+        count = 0
+        # 遍历目录寻找 index_*.pkl
+        for filename in os.listdir(index_dir):
+            # 严格匹配文件名模式，排除 image_index.pkl (全局索引) 和 text_index.pkl
+            if filename.startswith("index_") and filename.endswith(".pkl"):
+                # 提取类别名: index_apparel.pkl -> apparel
+                cat = filename.replace("index_", "").replace(".pkl", "")
+                file_path = os.path.join(index_dir, filename)
+
+                try:
+                    with open(file_path, 'rb') as f:
+                        data = pickle.load(f)
+
+                    # 简单校验数据结构，防止加载损坏文件
+                    if 'image_paths' not in data or 'image_index' not in data:
+                        print(f"⚠️ 跳过无效索引文件: {filename}")
+                        continue
+
+                    # 反序列化并存储
+                    # 注意：确保 __init__ 中已经初始化了 self.partition_indexes = {}
+                    self.partition_indexes[cat] = {
+                        'paths': data['image_paths'],
+                        'index': faiss.deserialize_index(data['image_index'])
+                    }
+                    print(f"✅ 已加载分片索引: {cat} (包含 {len(data['image_paths'])} 条数据)")
+                    count += 1
+                except Exception as e:
+                    print(f"❌ 加载分片 {filename} 失败: {e}")
+
+        return count > 0
     # 🚨 NEW FUNCTION: 基于向量的直接搜索接口 (支持用户兴趣向量)
     def search_images_by_vector(self, query_vector: np.ndarray, top_k: int = 5) -> List[Tuple[str, float]]:
         """
@@ -293,6 +433,49 @@ class CLIPMatcher:
                     results.append((image_path, float(score)))
                     if len(results) >= top_k:
                         break
+
+        return results
+
+    def search_in_partition(self, query_vector: np.ndarray, category: str, top_k: int = 5):
+        """
+        在指定的分片索引中搜索相似图像
+
+        Args:
+            query_vector: 查询向量 (numpy array)
+            category: 分片类别名称 (如 'apparel', 'footwear')
+            top_k: 期望返回的结果数量
+
+        Returns:
+            List[Tuple[str, float]]: [(图片路径, 相似度分数), ...]
+        """
+        # 1. 检查该分片是否存在
+        if category not in self.partition_indexes:
+            # 如果没有这个类别的索引（比如没有美妆数据），直接返回空，不报错
+            return []
+
+        target = self.partition_indexes[category]
+        index = target['index']
+        paths = target['paths']
+
+        # 2. 预处理向量 (确保是 2D float32)
+        if query_vector.ndim == 1:
+            query_vector = query_vector.reshape(1, -1)
+        query_vector = query_vector.astype('float32')
+
+        # 3. 智能调整 Top-K
+        # 如果请求 5 个结果，但该类别只有 2 张图，则只搜 2 张，防止 FAISS 报错或返回填充值
+        real_k = min(top_k, len(paths))
+        if real_k == 0:
+            return []
+
+        # 4. 执行搜索
+        scores, indices = index.search(query_vector, real_k)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            # FAISS 可能会在找不到足够结果时返回 -1，必须过滤
+            if idx != -1 and idx < len(paths):
+                results.append((paths[idx], float(score)))
 
         return results
 

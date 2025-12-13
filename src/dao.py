@@ -1,13 +1,13 @@
 import os
-import json
 import sqlite3
 from typing import Dict, List, Optional
 
 import pandas as pd
 from PIL import Image
 from PIL import UnidentifiedImageError
-from .db_utils import get_db_connection
+
 from .common import AppConfig, init_logger, get_all_image_paths
+from .db_utils import get_db_connection
 
 logger = init_logger("DAO")
 
@@ -86,9 +86,47 @@ class UserBehaviorDAO:
 
         return {"search_history": search_history, "click_history": click_history}
 
+    def get_recent_combined_behavior(self, user_id: int, limit: int) -> List[Dict]:
+        """
+        🚨 NEW: 获取最近的混合行为（点击+搜索），按时间倒序统一排序。
+        解决“搜索无法顶替点击”导致的推荐死锁问题。
+        """
+        if user_id is None:
+            return []
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        items = []
+        try:
+            # 1. 获取最近点击 (多取一些，比如 2*limit，方便后续混合排序)
+            fetch_limit = limit * 2
+            cursor.execute(
+                "SELECT image_path, timestamp FROM user_clicks WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (user_id, fetch_limit)
+            )
+            for path, ts in cursor.fetchall():
+                items.append({'type': 'click', 'value': path, 'timestamp': ts})
+
+            # 2. 获取最近搜索
+            cursor.execute(
+                "SELECT query_text, timestamp FROM user_searches WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (user_id, fetch_limit)
+            )
+            for query, ts in cursor.fetchall():
+                items.append({'type': 'search', 'value': query, 'timestamp': ts})
+
+        except Exception as e:
+            logger.error(f"读取混合行为失败: {e}")
+        finally:
+            conn.close()
+
+        # 3. 混合后按时间倒序排列，并只取前 N 个
+        items.sort(key=lambda x: x['timestamp'], reverse=True)
+        return items[:limit]
+
     def get_full_activity_history(self, user_id: int) -> List[Dict]:
         """
-        🚨 NEW FUNCTION: 检索所有用户活动记录（搜索和点击），按时间排序，用于可视化。
+        检索所有用户活动记录（搜索和点击），按时间排序，用于可视化。
         """
         if user_id is None:
             return []
@@ -134,7 +172,7 @@ class UserBehaviorDAO:
         return history
 
     def delete_all_behavior(self, user_id: int) -> bool:
-        """🚨 NEW FUNCTION: 删除某个用户的所有搜索和点击行为记录"""
+        """删除某个用户的所有搜索和点击行为记录"""
         if user_id is None:
             return False
 
@@ -163,6 +201,7 @@ class UserBehaviorDAO:
             conn.close()
 
         return success
+
 
 # -------------------------- 图片DAO（单一职责：图片加载操作） --------------------------
 class ImageDAO:
@@ -195,13 +234,12 @@ class ImageDAO:
 
         return caption_map
 
-        # 🚨 NEW: 提供根据图片路径查询 Caption 的接口
     def get_caption_by_path(self, path: str) -> str:
-            """根据图片绝对路径获取其 Caption，找不到则返回默认值"""
-            # 确保路径是绝对路径以便匹配 map 中的 key
-            abs_path = os.path.abspath(path)
-            # 🚨 默认英文描述
-            return self.caption_map.get(abs_path, "No description available")
+        """根据图片绝对路径获取其 Caption，找不到则返回默认值"""
+        # 确保路径是绝对路径以便匹配 map 中的 key
+        abs_path = os.path.abspath(path)
+        # 默认英文描述
+        return self.caption_map.get(abs_path, "No description available")
 
     def load_image(self, path: str) -> Optional[Image.Image]:
         """加载单张图片（解耦图片处理与业务逻辑）"""
@@ -240,20 +278,24 @@ class IndexDAO:
         self.clip_matcher = clip_matcher  # 依赖注入，解耦CLIP实现
 
     def load_or_build_indexes(self) -> None:
-        """加载或构建索引（解耦索引操作与业务逻辑）"""
+        """统一加载所有索引：全局图像、全局文本、以及分片索引"""
+        # 1. 加载全局图像索引 (用于图搜图)
         self._load_or_build_image_index()
+        # 2. 加载全局文本索引 (用于文搜图)
         self._load_or_build_text_index()
+        # 3. 加载分片索引 (用于解决类别不平衡的推荐系统)
+        self._load_partition_indexes()
 
     def _load_or_build_image_index(self) -> None:
         if os.path.exists(self.config.image_index_path):
             try:
                 self.clip_matcher.load_image_index(self.config.image_index_path)
-                logger.info("加载图像索引成功")
+                logger.info("加载全局图像索引成功")
                 return
             except Exception as e:
-                logger.error(f"加载图像索引失败: {str(e)}")
+                logger.error(f"加载全局图像索引失败: {str(e)}")
 
-        logger.info("构建图像索引...")
+        logger.info("构建全局图像索引...")
         if os.path.exists(self.config.image_folder):
             self.clip_matcher.build_image_index(self.config.image_folder)
         else:
@@ -263,13 +305,40 @@ class IndexDAO:
         if os.path.exists(self.config.text_index_path):
             try:
                 self.clip_matcher.load_text_index(self.config.text_index_path)
-                logger.info("加载文本索引成功")
+                logger.info("加载全局文本索引成功")
                 return
             except Exception as e:
-                logger.error(f"加载文本索引失败: {str(e)}")
+                logger.error(f"加载全局文本索引失败: {str(e)}")
 
-        logger.info("构建文本索引...")
+        logger.info("构建全局文本索引...")
         if os.path.exists(self.config.style_csv_path):
             self.clip_matcher.build_text_index(self.config.style_csv_path)
         else:
             logger.warning("文本CSV文件不存在，跳过文本索引构建")
+
+    def _load_partition_indexes(self) -> None:
+        """
+        🚨 NEW METHOD: 加载分片索引
+        自动推断索引所在目录（通常与 image_index.pkl 在同一目录或项目根目录）
+        """
+        # 假设分片索引和全局索引在同一目录下
+        # 如果 config.image_index_path 是 "image_index.pkl"，则 dir 为空字符串，代表当前目录 "."
+        index_dir = os.path.dirname(self.config.image_index_path)
+        if not index_dir:
+            index_dir = "."
+
+        logger.info(f"正在尝试加载分片索引 (目录: {index_dir})...")
+        try:
+            # 调用 CLIPMatcher 的新方法
+            success = self.clip_matcher.load_partition_indexes(index_dir)
+
+            if success:
+                logger.info("✅ 分片索引加载成功 (推荐系统已增强)")
+            else:
+                logger.warning(
+                    "⚠️ 未检测到有效的分片索引文件 (index_*.pkl)。推荐系统将降级运行，建议运行 build_index.py 重建索引。")
+
+        except AttributeError:
+            logger.error("❌ CLIPMatcher 缺少 load_partition_indexes 方法，请检查代码更新。")
+        except Exception as e:
+            logger.error(f"❌ 加载分片索引时发生未知错误: {str(e)}")
