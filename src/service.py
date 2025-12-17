@@ -145,51 +145,51 @@ class RecommendService:
         self._last_recommendation_cache: Dict[int, Tuple[List[Tuple[Image.Image, str]], str]] = {}
 
     # 🚨 核心修正：接收 user_id，使用混合历史数据构建向量
+    # 替换原有的 _build_user_interest_vector 方法
     def _build_user_interest_vector(self, user_id: int) -> Optional[np.ndarray]:
-        """
-        [修正版] 构建用户向量：使用统一时间窗口，最近的行为（无论搜索还是点击）权重最高
-        """
-        # 1. 获取混合历史 (例如最近 3 条)
         limit = self.config.recent_behavior_cnt
-        # 调用 DAO 中新增的混合历史接口
+        # 获取混合历史，按时间倒序排列（index 0 是最新的）
         recent_items = self.behavior_dao.get_recent_combined_behavior(user_id, limit)
 
         if not recent_items:
             return None
 
         vectors = []
+        # 记录每个向量对应的时间权重
+        weights = []
 
-        # 2. 分别编码
-        clicks = [item['value'] for item in recent_items if item['type'] == 'click']
-        searches = [item['value'] for item in recent_items if item['type'] == 'search']
-
-        if clicks:
+        # 遍历历史记录进行编码
+        for i, item in enumerate(recent_items):
+            vec = None
             try:
-                img_features = self.clip_matcher.encode_images(clicks)
-                if img_features.size > 0:
-                    vectors.append(img_features)
-            except Exception as e:
-                logger.error(f"图像向量编码失败: {e}")
+                if item['type'] == 'click':
+                    vec = self.clip_matcher.encode_images([item['value']])
+                elif item['type'] == 'search':
+                    clean_text = item['value'].replace("[图搜]", "").strip()
+                    vec = self.clip_matcher.encode_texts([clean_text])
 
-        if searches:
-            try:
-                # 过滤掉 "[图搜]" 前缀
-                clean_searches = [s.replace("[图搜]", "").strip() for s in searches]
-                text_features = self.clip_matcher.encode_texts(clean_searches)
-                if text_features.size > 0:
-                    vectors.append(text_features)
+                if vec is not None and vec.size > 0:
+                    vectors.append(vec)
+                    # 核心逻辑：生成衰减权重
+                    # 例如 limit=3，权重可能是 [1.0, 0.5, 0.25]
+                    # 越新的行为（index越小），权重越大
+                    weights.append(1.0 / (i + 1))
             except Exception as e:
-                logger.error(f"文本向量编码失败: {e}")
+                logger.error(f"向量编码失败: {e}")
 
         if not vectors:
             return None
 
-        # 3. 聚合
+        # 堆叠向量
         all_vectors = np.vstack(vectors)
-        user_vector = np.mean(all_vectors, axis=0)
-        # 4. 归一化
-        user_vector = user_vector / np.linalg.norm(user_vector)
+        weight_arr = np.array(weights)
 
+        # 核心逻辑：使用 np.average 进行加权平均
+        # axis=0 表示在列方向（特征维度）上计算
+        user_vector = np.average(all_vectors, axis=0, weights=weight_arr)
+
+        # 归一化
+        user_vector = user_vector / np.linalg.norm(user_vector)
         return user_vector.astype('float32').reshape(1, -1)
 
     def _get_random_recommendation(self) -> List[Tuple[Image.Image, str]]:
